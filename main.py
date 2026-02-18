@@ -13,7 +13,7 @@ from risk_manager import RiskManager
 from settings import cfg
 import numpy as np
 from advanced_engine import AdvancedMarketEngine # <--- NEU
-
+import joblib
 
 
 class EnterpriseBot:
@@ -168,6 +168,29 @@ class EnterpriseBot:
             if market_open <= now <= market_close: return True
                 
         return False
+
+    def execute_trade(self, symbol, side, strategy, ai_score):
+        try:
+            # 1. SL/TP Berechnung (Beispielwerte, falls nicht im Signal)
+            bid, ask = self.mt5.get_live_price(symbol)
+            price = ask if side == "LONG" else bid
+            
+            # Hier nutzt du deinen RiskManager für die Lot-Größe
+            sl_dist = price * 0.002 # 0.2% Puffer
+            sl = price - sl_dist if side == "LONG" else price + sl_dist
+            tp = price + (sl_dist * 2) if side == "LONG" else price - (sl_dist * 2)
+            
+            shares = self.risk_manager.calculate_position_size(symbol, price, sl)
+            
+            if shares > 0:
+                success = self.mt5.submit_order(symbol, side, shares, sl, tp, strategy)
+                if success:
+                    log.info(f"✅ TRADE PLATZIERT: {symbol} {side} | Lots: {shares}")
+            else:
+                log.warning(f"⚠️ Lot-Größe für {symbol} ist 0. Risiko-Check fehlgeschlagen.")
+                
+        except Exception as e:
+            log.error(f"Fehler in execute_trade: {e}")
 
     def fetch_candles(self, symbol):
         """Holt historische Daten DIREKT aus MT5"""
@@ -673,50 +696,61 @@ class EnterpriseBot:
                 # 3. SCANNING LOOP
                 for symbol in cfg.SYMBOLS:
                     try:
-
+                        # Grundlegende Daten holen
                         df = self.fetch_candles(symbol)
                         if df is None or df.empty: continue
 
-                        # A) MARKT-FILTER (Velocity etc.)
-                        velocity = self.adv_engine.get_tick_velocity(symbol)
-                        if velocity > 8.0: continue
+                        # 1. KI-Wahrscheinlichkeit sofort holen (für den Log)
+                        ai_prob = self.ai.get_prediction_prob(symbol, df)
+                        bid, ask = self.mt5.get_live_price(symbol)
+                        mid_price = (bid + ask) / 2 if bid else 0
 
-                        # B) STRATEGIE-SIGNAL (VAH/VAL Rejection oder Breakout)
+                        # 2. Technische Strategie prüfen
                         direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df, self.vp_engine)
-        
+
+                        # 3. JETZT LOGGEN (Bevor die continues kommen!)
+                        # So siehst du bei JEDEM Scan, was Sache ist
+                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | AI:{ai_prob:.2f} | Strategie: {strategy_name}")
+
+                        # --- AB HIER DIE HARTE FILTERUNG ---
+
+                            # A) MARKT-FILTER (Velocity)
+                        velocity = self.adv_engine.get_tick_velocity(symbol)
+                        if velocity > 8.0: 
+                            continue
+
+                        # B) TECHNISCHES SETUP DA?
                         if not direction:
-                            continue # Kein technisches Setup -> Nächstes Symbol
-
-                        # C) KI-BESTÄTIGUNG (Der 70% Scharfschütze)
-                        # Wir holen die Wahrscheinlichkeiten für [Nix, Long, Short]
-                        probs = self.ai.get_prediction_proba_all(symbol, df)
-        
-                        # DEFINIERE DEINEN ANSPRUCH (Hier stellst du die Winrate ein!)
-                        THRESHOLD = 0.70 
-
-                        is_ai_confirmed = False
-                        ai_score = 0
-
-                        if direction == "LONG":
-                            ai_score = probs[1] # Wahrscheinlichkeit für Klasse 1 (Long Win)
-                            if ai_score >= THRESHOLD:
-                                is_ai_confirmed = True
-        
-                        elif direction == "SHORT":
-                            ai_score = probs[2] # Wahrscheinlichkeit für Klasse 2 (Short Win)
-                            if ai_score >= THRESHOLD:
-                                is_ai_confirmed = True
-
-                        # --- DAS AUSSCHLUSSVERFAHREN ---
-                        if not is_ai_confirmed:
-                            # Optional: log.info(f"🛑 {symbol}: Setup ok, aber KI zu unsicher ({ai_score:.2%})")
                             continue 
 
-                        # D) EXECUTION (Nur wenn wir hier ankommen, wird getradet!)
-                        log.info(f"🔥 VOLLTREFFER: {symbol} | {direction} | KI-Sicherheit: {ai_score:.2%}")
-        
-                        # Hier folgt dein Code für Lot-Berechnung und mt5.order_send...
-                        self.execute_trade(symbol, direction, strategy_name, ai_score)
+                        # C) KI-SCHWELLENWERT (Threshold)
+                        # KI Meinung abfragen
+                        ai_decision = self.ai.get_ai_prediction(symbol, df)
+    
+                        win_prob = ai_decision['long']  # Das ist unser 'Win' Score
+                        loss_prob = ai_decision['short'] # Das ist unser 'Loss' Score
+
+                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | Win:{win_prob:.2f} | Loss:{loss_prob:.2f} | Strat: {strategy_name}")
+
+                        # --- DER SCHUTZ-FILTER ---
+                        # 1. Wenn die KI sagt "Nix tun" ist am wahrscheinlichsten -> ABBRUCH
+                        if ai_decision["nix"] > ai_decision["long"] and ai_decision["nix"] > ai_decision["short"]:
+                            continue
+
+                        # 2. Threshold prüfen (70%)
+                        THRESHOLD = 0.70
+                        if current_ai_score < THRESHOLD:
+                            continue
+
+                        if not is_ai_confirmed:
+                            # Optional: log.info(f"🛑 {symbol}: Setup ok, aber KI unsicher.")
+                            continue 
+
+                        # D) EXECUTION (Wird nur bei Volltreffer erreicht)
+                        log.info(f"🔥 VOLLTREFFER: {symbol} | {direction} | KI: {ai_prob:.2%}")
+                        self.execute_trade(symbol, direction, strategy_name, ai_prob)
+
+
                         
                         # A) MARKET CHECK
                         if not self.is_asset_tradable_now(symbol):
@@ -726,13 +760,6 @@ class EnterpriseBot:
                         # B) COOLDOWN
                         if self.db.get_minutes_since_last_trade(symbol) < 15:
                             if is_debug_symbol: log.info(f"⏳ {symbol} Cooldown aktiv.")
-                            continue
-
-                        # C) DATEN HOLEN (Yahoo)
-                        # Hier schauen wir genau hin!
-                        df = self.fetch_candles(symbol)
-                        if df is None or df.empty:
-                            if is_debug_symbol: log.warning(f"⚠️ {symbol}: Yahoo liefert KEINE DATEN! (Download fehlgeschlagen)")
                             continue
 
                         # D) LIVE PREIS (MT5)
@@ -753,7 +780,6 @@ class EnterpriseBot:
                         # ==========================================
                         # 🧠 UPGRADE 2: SMART STRATEGY & AI FILTER
                         # ==========================================
-                        
                         # 1. Schritt: Prüfe die Volumen-Profile Logik (Sticky Protection, Momentum)
                         # Wir übergeben das df und die vp_engine
                         direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df, self.vp_engine)
@@ -766,7 +792,7 @@ class EnterpriseBot:
                         ai_prob = self.ai.get_prediction_prob(symbol, df)
                         
                         # Info Log für dich
-                        log.info(f"🔎 [{symbol}] Preis:{mid_price:.2f} | AI:{ai_prob:.2f} | Strategie: {strategy_name}")
+                        
 
                         # 3. Schritt: Das Ausschlussverfahren (Threshold)
                         # Wir traden nur, wenn Strategie UND KI-Sicherheit (z.B. 60%) stimmen
