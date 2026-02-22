@@ -350,46 +350,38 @@ class EnterpriseBot:
         except Exception as e:
             log.error(f"Fehler im Trailing: {e}")
 
-    def check_stop_and_reverse(self, pos, current_price, symbol):
+    # UPDATE: Wir übergeben das aktuelle Signal (current_signal) an die Funktion
+    def check_stop_and_reverse(self, pos, current_price, symbol, current_signal):
         """
         Prüft, ob ein Trade gedreht werden muss (Stop & Reverse).
-        Logik: Wenn SL fast getroffen ist -> Schließen & Gegentrade öffnen.
+        Logik: Dreht den Trade sofort, wenn das Live-Signal in die exakte Gegenrichtung umschlägt 
+        (z.B. False Breakout am VAH/VAL), ohne auf den SL zu warten.
         """
-        # Einstellungen
-        REVERSE_TRIGGER_PIPS = 3.0  # Wie viele Pips VOR dem SL drehen wir?
-        MULTIPLIER = 1.0            # 1.0 = Gleiche Größe, 1.5 = Verlust rausholen (Martingale light)
+        MULTIPLIER = 1.0  # 1.0 = Gleiche Größe, 1.5 = Verlust rausholen
         
-        # Nur drehen, wenn es noch kein "Reversal-Trade" ist (erkennbar am Kommentar)
+        # Nur drehen, wenn es noch kein "Reversal-Trade" ist
         if pos.comment and "REVERSE" in pos.comment:
             return False
 
-        sl_price = pos.sl
-        if sl_price == 0: return False
-
-        # --- CHECK: Sind wir nah am SL? ---
         should_reverse = False
-        point = self.mt5.mt5.symbol_info(symbol).point
-        
-        # Long Trade (SL ist unter uns)
-        if pos.type == self.mt5.mt5.ORDER_TYPE_BUY:
-            dist_to_sl = (current_price - sl_price) / point
-            # Wenn wir weniger als 3 Pips vom SL weg sind (und SL unter Preis ist)
-            if dist_to_sl <= REVERSE_TRIGGER_PIPS and current_price > sl_price:
-                should_reverse = True
-                new_side = "SHORT"
-                
-        # Short Trade (SL ist über uns)
-        elif pos.type == self.mt5.mt5.ORDER_TYPE_SELL:
-            dist_to_sl = (sl_price - current_price) / point
-            if dist_to_sl <= REVERSE_TRIGGER_PIPS and current_price < sl_price:
-                should_reverse = True
-                new_side = "LONG"
+        new_side = None
+
+        # --- NEUE LOGIK: Signal-Abgleich ---
+        # Long Trade, aber das aktuelle Signal schreit plötzlich SHORT
+        if pos.type == self.mt5.mt5.ORDER_TYPE_BUY and current_signal == "SHORT":
+            should_reverse = True
+            new_side = "SHORT"
+            
+        # Short Trade, aber das aktuelle Signal schreit plötzlich LONG
+        elif pos.type == self.mt5.mt5.ORDER_TYPE_SELL and current_signal == "LONG":
+            should_reverse = True
+            new_side = "LONG"
 
         # --- EXECUTION ---
         if should_reverse:
-            log.warning(f"🔄 SWITCH-SIGNAL für {symbol}: Drehe Position auf {new_side}!")
+            log.warning(f"🔄 FALSE BREAKOUT BEI {symbol}: Drehe Position sofort auf {new_side}!")
             
-            # 1. Alten Trade schließen
+            # 1. Alten Trade schließen (Dein bestehender Code)
             close_req = {
                 "action": self.mt5.mt5.TRADE_ACTION_DEAL,
                 "position": pos.ticket,
@@ -406,14 +398,10 @@ class EnterpriseBot:
                 log.error(f"Konnte Switch nicht ausführen (Close failed): {res.comment}")
                 return False
 
-            # 2. Neuen Trade öffnen (Gegenrichtung)
-            # Wir nehmen den gleichen Abstand für TP/SL wie vorher, nur umgedreht
+            # 2. Neuen Trade öffnen (Dein bestehender Code für vol, sl_dist, tp_dist etc.)
             vol = pos.volume * MULTIPLIER
-            
-            # SL/TP für den neuen Trade berechnen (Simpel: 20 Pips SL, 40 Pips TP)
-            # Besser wäre dynamisch, aber hier als Beispiel fest:
-            sl_dist = 0.0020 * current_price # ca 20 Pips
-            tp_dist = 0.0040 * current_price # ca 40 Pips
+            sl_dist = 0.0020 * current_price 
+            tp_dist = 0.0040 * current_price 
             
             if new_side == "LONG":
                 new_sl = current_price - sl_dist
@@ -435,7 +423,7 @@ class EnterpriseBot:
                 "sl": new_sl,
                 "tp": new_tp,
                 "magic": 234000,
-                "comment": "REVERSE Entry", # WICHTIG: Damit wir nicht nochmal drehen!
+                "comment": "REVERSE Entry", 
                 "type_time": self.mt5.mt5.ORDER_TIME_GTC,
                 "type_filling": self.mt5.mt5.ORDER_FILLING_IOC,
             }
@@ -690,7 +678,7 @@ class EnterpriseBot:
                         # print(f"Prüfe {symbol}...") # (Optional)
                         
                         if not self.is_asset_tradable_now(symbol): 
-                            print(f"🛑 {symbol}: Markt ist geschlossen.")
+                            #print(f"🛑 {symbol}: Markt ist geschlossen.")
                             continue
                             
                         if self.db.get_minutes_since_last_trade(symbol) < 15: 
@@ -699,20 +687,28 @@ class EnterpriseBot:
                         
                         tick = self.mt5.mt5.symbol_info_tick(symbol)
                         if not tick or tick.ask == 0: 
-                            print(f"❌ {symbol}: MT5 liefert keine Preise (Marktübersicht prüfen!)")
+                            #print(f"❌ {symbol}: MT5 liefert keine Preise (Marktübersicht prüfen!)")
                             continue
                         
-                        spread_pips = (tick.ask - tick.bid) / self.mt5.mt5.symbol_info(symbol).point
-                        if spread_pips > 20.0: 
-                            print(f"📈 {symbol}: Spread zu hoch ({spread_pips:.1f}).")
+                        # --- NEUER PROZENTUALER SPREAD-FILTER ---
+                        current_spread = tick.ask - tick.bid
+                        mid_price_temp = (tick.ask + tick.bid) / 2
+                        spread_pct = (current_spread / mid_price_temp) * 100
+                        
+                        # Erlaubt maximal 0.15% Spread (Perfekt für Forex, Krypto & Gold)
+                        MAX_SPREAD_PCT = 0.1 
+                        
+                        if spread_pct > MAX_SPREAD_PCT: 
+                            #print(f"📈 {symbol}: Spread zu hoch ({spread_pct:.3f}%).")
                             continue 
+                        # ----------------------------------------
 
                         # --- DATEN HOLEN (DUAL-TF) ---
                         df_m5 = self.fetch_candles(symbol, timeframe=self.mt5.mt5.TIMEFRAME_M5)
                         df_m1 = self.fetch_candles(symbol, timeframe=self.mt5.mt5.TIMEFRAME_M1)
                         
                         if df_m5 is None or df_m5.empty or df_m1 is None or df_m1.empty:
-                            print(f"📉 {symbol}: Keine Kerzendaten.")
+                            #print(f"📉 {symbol}: Keine Kerzendaten.")
                             continue
 
                         bid, ask = self.mt5.get_live_price(symbol)
@@ -721,6 +717,7 @@ class EnterpriseBot:
                         # --- 1. TECHNISCHE STRATEGIE (M5) ---
                         direction, strategy_name = self.adv_engine.check_entry_signal(symbol, df_m5, self.vp_engine)
                         strat_display = strategy_name if direction else "Wartend (Kein VAH/VAL Break)"
+                        #print(direction)
 
                         # --- 2. KI BEFRAGEN FÜR LOGGING (M5) ---
                         ai_m5 = self.ai.get_ai_prediction(symbol, df_m5, tf_name="M5")
